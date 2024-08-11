@@ -13,6 +13,7 @@ description: |
 license: Apache-2.0
 platforms:
     amd64:
+    arm64:
 
 # To ensure the django-framework extension works properly, your Django application
 # should have an `wsgi.py` file with an `application` object as the WSGI entrypoint.

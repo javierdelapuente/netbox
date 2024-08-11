@@ -1,17 +1,74 @@
+* Considerations
+
+For now, Using a lxd or VM machine bridged to the same network as the host. If the IP
+address of the machine changes, all will break apart, so the bridged network interface
+IP address should be stable... (which is in this tutorial will be related to the DHCP server...).
+
+There are other alternatives, for example a reverse proxy, which may be a more sensible,
+this one is just for testing.
+
 * Machine preparation
+
 ** Host machine
 Installed 24.04 from https://github.com/Joshua-Riek/ubuntu-rockchip.
 Should also work with 22.04 or with armbian, but I have not tested it.
+
+*** Netplan
+Something like this is the update netplan plan. The =br0= integrace will be used
+when configuring the container or the VM.
+
+TODO fix so it is generic and not related to my macaddress or interface names.
+
+#+name: /etc/netplan/10-network.yaml
+#+begin_src yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    enP4p65s0:
+      dhcp4: false
+      match:
+        macaddress: c0:74:2b:fe:8e:2e
+  bridges:
+    br0:
+      dhcp4: true
+      interfaces:
+        - enP4p65s0
+      parameters:
+        forward-delay: 0
+        stp: false
+      optional: true
+#+end_src
 
 
 ** Multipass/VM
 To run VMs there is an issue with qemu (see https://github.com/Joshua-Riek/ubuntu-rockchip/issues/731),
 you will need to disable some cpus, like sudo ~chcpu --disable 0,1,2,3~
 
-After that, you can create the VM with
-~multipass launch 22.04 --cpus 4 --memory 8G --disk 100G~
+#+begin_src bash
+  sudo snap install multipass
+  sudo chcpu --disable 0,1,2,3
+  multipass launch 22.04 --cpus 4 --memory 12G --disk 100G --network br0 --name netbox
+  multipass shell netbox
+#+end_src
 
-** LXD container
+
+From here on, everything inside the VM.
+
+#+begin_src bash
+  sudo apt update
+  sudo apt install jq -y
+  sudo snap install yq
+  sudo snap install rockcraft --channel=latest/edge --classic
+  sudo snap install charmcraft --channel=latest/edge --classic
+  lxd init --auto
+  # YMMV. Ugly hack.
+  sudo cat /etc/netplan/50-cloud-init.yaml | yq -e '.network.ethernets.extra0.dhcp4-overrides.route-metric |= 90' - | sudo tee /etc/netplan/99-override-networks.yaml
+  sudo netplan apply
+#+end_src
+
+
+** TODO LXD container (recommended)
 
 Use the profile in https://microk8s.io/docs/install-lxd. You may need to remove the netlink_diag kernel
 module.
@@ -21,18 +78,38 @@ Create the container with ~lxc launch -p default -p microk8s ubuntu:22.04 netbox
 After rebooting, you may need to run ~apparmor_parser -r /var/lib/snapd/apparmor/profiles/*~. If
 necessary, put that line into the =rc.local= file.
 
+#+begin_src bash
+  TODO BRIDGE FIX HELP
+  lxc launch -p default -p microk8s ubuntu:22.04 netbox
+  lxc exec netbox -- su --login ubuntua 
+  TODO ARPPARMOR FIX?
+#+end_src
 
-* Base installation
+
+* NetBox installation
 
 ** MicroK8S
-#+begin_src
+
+It may be interesting to do this after building everything... instead of at the beginning.
+
+
+#+begin_src bash
   sudo snap install microk8s --channel=1.30-strict/stable
   sudo usermod -a -G snap_microk8s ubuntu
-  newgrp  snap_microk8s
-  sudo microk8s.enable registry storage ingress
+  newgrp snap_microk8s
+  microk8s status --wait-ready
+  sudo microk8s.enable dns
+  microk8s.kubectl rollout status deployments/coredns -n kube-system -w --timeout=600s
+  sudo microk8s.enable hostpath-storage
+  microk8s.kubectl rollout status deployments/hostpath-provisioner -n kube-system -w --timeout=600s
+  sudo microk8s.enable registry
+  microk8s.kubectl rollout status deployment.apps/registry -n container-registry -w --timeout=600s
+  sudo microk8s.enable ingress
+  # Will break if the IP address of the machine changes.
   IPADDR=$(ip -4 -j route get 2.2.2.2 | jq -r '.[] | .prefsrc')
   sudo microk8s enable metallb:$IPADDR-$IPADDR
 
+  # TODO some wait again in here? (a kubectl rollout status -w for something?)
   mkdir $HOME/.kube
   microk8s config | sudo -u ubuntu tee /home/ubuntu/.kube/config > /dev/null
   sudo snap alias microk8s.kubectl kubectl
@@ -45,6 +122,8 @@ necessary, put that line into the =rc.local= file.
   mkdir -p $HOME/.local/share/juju
   juju bootstrap microk8s microk8s
 #+end_src
+
+
 
 ** Netbox
 
@@ -59,10 +138,216 @@ necessary, put that line into the =rc.local= file.
 
 *** PostgreSQL
 #+begin_src
-  juju deploy postgresql-k8s --channel 14/edge --trust
+  juju deploy postgresql-k8s --trust
 #+end_src
 
-*** TODO Redis
-*** TODO Mongo and s3-integrator
-*** TODO Traefik
+*** Redis
+
+**** Fix redis rock
+Add arm64 architecture to https://github.com/canonical/charmed-redis-rock.git
+
+Clone the repo
+#+begin_src bash
+  git clone https://github.com/canonical/charmed-redis-rock.git
+  cd charmed-redis-rock
+#+end_src 
+
+
+Apply this patch file with ~git apply charmed-redis-rock.patch~.
+
+#+name: charmed-redis-rock.patch
+#+begin_src
+diff --git a/rockcraft.yaml b/rockcraft.yaml
+index 070049b..c97e9a5 100644
+--- a/rockcraft.yaml
++++ b/rockcraft.yaml
+@@ -15,6 +15,7 @@ license: Apache-2.0  # your application's SPDX license
+ 
+ platforms:  # The platforms this ROCK should be built on and run on
+   amd64:
++  arm64:
+ 
+ services:
+   redis:
+#+end_src
+
+
+Pack and upload to MicroK8S registry
+#+begin_src
+  rockcraft pack
+  rockcraft.skopeo --insecure-policy copy --dest-tls-verify=false oci-archive:charmed-redis_7.2.5_arm64.rock docker://localhost:32000/charmed-redis:latest
+#+end_src
+
+
+**** Fix and deploy redis charm
+
+#+begin_src
+  git clone https://github.com/canonical/redis-k8s-operator.git  
+  cd redis-k8s-operator
+#+end_src
+
+Apply this patch file with ~git apply redis-k8s-operator.patch~.
+
+#+name: redis-k8s-operator.patch
+#+begin_src
+diff --git a/charmcraft.yaml b/charmcraft.yaml
+index ac4024b..8e87f58 100644
+--- a/charmcraft.yaml
++++ b/charmcraft.yaml
+@@ -6,9 +6,23 @@ bases:
+   - build-on:
+       - name: "ubuntu"
+         channel: "22.04"
++        architectures:
++          - amd64
+     run-on:
+       - name: "ubuntu"
+         channel: "22.04"
++        architectures:
++          - amd64
++  - build-on:
++      - name: "ubuntu"
++        channel: "22.04"
++        architectures:
++          - arm64
++    run-on:
++      - name: "ubuntu"
++        channel: "22.04"
++        architectures:
++          - arm64
+ parts:
+   charm:
+     charm-python-packages: [setuptools]
+diff --git a/metadata.yaml b/metadata.yaml
+index 35516a4..1013864 100644
+--- a/metadata.yaml
++++ b/metadata.yaml
+@@ -12,17 +12,8 @@ tags:
+   - kubernetes
+   - redis
+ summary: >
+-  Redis is an open source (BSD licensed), in-memory data structure store, used
+-  as a database, cache, and message broker. Redis provides data structures
+-  such as strings, hashes, lists, sets, sorted sets with range queries,
+-  bitmaps, hyperloglogs, geospatial indexes, and streams. Redis has built-in
+-  replication, Lua scripting, LRU eviction, transactions, and different levels
+-  of on-disk persistence, and provides high availability via Redis Sentinel and
+-  automatic partitioning with Redis Cluster.
+-
+   This charm supports Redis in Kubernetes environments, using k8s services
+-  for load balancing. This supports a simple Redis topology. Although multiple
+-  units are allowed, replication and clustering are not supported for the moment.
++  for load balancing. This supports a simple Redis topology.
+ maintainers:
+   - Eduardo Mucelli R. Oliveira <eduardo.mucelli@canonical.com>
+   - Raul Zamora Martinez <raul.zamora@canonical.com>
+#+end_src
+
+
+Pack and deploy charm.
+#+begin_src
+  charmcraft pack
+  juju deploy ./redis-k8s_ubuntu-22.04-arm64.charm --resource redis-image=localhost:32000/charmed-redis:latest
+#+end_src
+
+
+*** Minio and s3-integrator
+
+Deploy s3-integrator:
+
+#+begin_src
+  juju deploy s3-integrator --channel edge
+#+end_src
+
+
+**** TODO minio with charmcraft
+Pending to prepare the mongodb charm for arm64 (it uses a snap without a release for arm64).
+git@github.com:canonical/charmed-mongodb-snap.git
+git@github.com:canonical/charmed-mongodb-rock.git
+git@github.com:canonical/mongodb-k8s-operator.git
+
+Minio needs to be included the ingress/Gateway API, so it can be access from the browser.
+
+**** Minio with docker
+
+For docker, you may get into troubles with firewalls,
+see https://documentation.ubuntu.com/lxd/en/latest/howto/network_bridge_firewalld/#prevent-connectivity-issues-with-lxd-and-docker
+#+begin_src
+  echo "net.ipv4.conf.all.forwarding=1" | sudo tee /etc/sysctl.d/99-forwarding.conf
+  sudo systemctl restart systemd-sysctl
+  
+  sudo snap install docker
+  sudo addgroup --system docker
+  sudo adduser $USER docker
+  newgrp docker
+  sudo snap disable docker
+  sudo snap enable docker
+  
+  mkdir -p ${HOME}/minio/data
+  docker run -d -p 9000:9000 -p 9001:9001 --user $(id -u):$(id -g) --name minio -e "MINIO_ROOT_USER=minioadmin" -e "MINIO_ROOT_PASSWORD=minioadmin" -v ${HOME}/minio/data:/data quay.io/minio/minio server /data --console-address ":9001"
+#+end_src
+
+Configure minio and s3-integrator (wait until minio working)
+#+begin_src
+  export AWS_ACCESS_KEY_ID=minio
+  export AWS_SECRET_ACCESS_KEY=supersuperkey
+  docker exec minio mc config host add minio http://127.0.0.1:9000 minioadmin minioadmin
+  docker exec minio mc admin user svcacct add --access-key "${AWS_ACCESS_KEY_ID}" --secret-key "${AWS_SECRET_ACCESS_KEY}" minio minioadmin
+  docker exec minio mc mb minio/netbox
+  docker exec minio mc ls minio  
+
+  # If this ip changes, s3 will break and the s3-integrator should be reconfigured.
+  # if this is not the real public ip addr, s3 images will not work in the browser.
+  IPADDR=$(ip -4 -j route get 2.2.2.2 | jq -r '.[] | .prefsrc') && echo "${IPADDR}"
+  juju config s3-integrator endpoint="http://${IPADDR}:9000" bucket=netbox path=/ region=us-west-1 s3-uri-style=path
+  juju wait-for application s3-integrator --query='name=="s3-integrator" && (status=="active" || status=="blocked")'
+  juju run s3-integrator/leader sync-s3-credentials access-key=${AWS_ACCESS_KEY_ID} secret-key=${AWS_SECRET_ACCESS_KEY}
+#+end_src
+
+*** TODO Ingress/Gateway Api
+
+**** TODO Traefik
+Pending to adapt to arm64
+
+**** TODO nginx-integrator
+
+It is currently (2024-08-11) broken for arm64. The error is:
+unit-nginx-ingress-integrator-0: 12:34:45 WARNING unit.nginx-ingress-integrator/0.remove ImportError: /var/lib/juju/agents/unit-nginx-ingress-integrator-0/charm/venv/cryptography/hazmat/bindings/_rust.abi3.so: cannot open shared object file: No such file or directory
+
+#+begin_src
+  git clone https://github.com/canonical/nginx-ingress-integrator-operator.git
+  cd nginx-ingress-integrator-operator
+  charmcraft pack
+
+  juju deploy ./nginx-ingress-integrator_ubuntu-20.04-arm64.charm --channel=latest/edge --trust
+  NETBOX_HOSTNAME=netbox.internal
+  juju config nginx-ingress-integrator service-hostname=${NETBOX_HOSTNAME}
+  juju config nginx-ingress-integrator path-routes="/"
+#+end_src
+
 *** TODO NetBox
+
+#+begin_src
+  git clone https://github.com/javierdelapuente/netbox.git -b orangepi5
+  cd netbox
+  export ROCKCRAFT_ENABLE_EXPERIMENTAL_EXTENSIONS=1
+  rockcraft pack
+  rockcraft.skopeo --insecure-policy copy --dest-tls-verify=false oci-archive:netbox_0.1_arm64.rock docker://localhost:32000/netbox:latest
+
+  cd charm
+  export CHARMCRAFT_ENABLE_EXPERIMENTAL_EXTENSIONS=1
+  charmcraft pack
+  cd ..
+
+  juju deploy ./charm/netbox_ubuntu-22.04-arm64.charm --resource django-app-image=localhost:32000/netbox:latest --config django-allowed-hosts='*' --config saml-username=email
+  
+#+end_src
+
+
+#+begin_src
+  juju integrate redis-k8s netbox
+  juju integrate postgresql-k8s netbox
+  juju integrate s3-integrator netbox  
+
+  juju integrate nginx-ingress-integrator netbox
+#+end_src
